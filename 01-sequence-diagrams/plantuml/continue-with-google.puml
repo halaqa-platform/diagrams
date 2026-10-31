@@ -1,0 +1,88 @@
+@startuml continue-with-google
+title Continue with Google (S2-BE-06)
+
+autonumber
+skinparam responseMessageBelowArrow true
+skinparam sequenceMessageAlign center
+
+actor "User" as U
+participant "Frontend\n(localhost:5173)" as FE
+participant "Google\nIdentity Services" as G
+participant "AuthEndpoints\nPOST /api/v1/auth/google" as EP
+participant "AuthService\nGoogleLoginAsync" as AS
+participant "GoogleTokenValidator" as GV
+participant "UserManager\n(ASP.NET Identity)" as UM
+database "SQL Server\nAspNetUsers\nAspNetUserLogins\nRefreshTokens" as DB
+
+== 1. Get an ID token from Google ==
+U -> FE : clicks "Sign in with Google"
+FE -> G : open sign-in (Client ID)
+G -> U : choose account
+U -> G : signs in
+G --> FE : ID token (JWT signed by Google)
+
+== 2. Send it to our API ==
+FE -> EP : { idToken, deviceName }
+EP -> AS : GoogleLoginAsync(request)
+
+== 3. Check the token ==
+AS -> GV : ValidateAsync(idToken)
+alt token empty
+  GV --> AS : null
+else Client ID not configured
+  GV --> AS : null (logs error)
+else signature / expiry / audience wrong
+  GV -> G : get Google public keys (cached)
+  GV --> AS : null (InvalidJwtException caught)
+else valid
+  GV -> G : get Google public keys (cached)
+  GV --> AS : GoogleUserInfo(Subject, Email, EmailVerified, Name)
+end
+
+opt info is null OR email not verified
+  AS --> EP : Fail(InvalidGoogleToken)
+  EP --> FE : 401 { code: "invalid_google_token" }
+end
+
+== 4. Find, link or create the user ==
+AS -> UM : FindByLoginAsync("Google", Subject)
+UM -> DB : AspNetUserLogins
+alt signed in with Google before
+  UM --> AS : user
+else first time with Google
+  AS -> UM : FindByEmailAsync(Email)
+  alt email already registered (e.g. teacher)
+    UM --> AS : existing user (role kept)
+  else brand-new person
+    AS -> UM : CreateAsync(user, no password)
+    AS -> UM : AddToRoleAsync(user, "Student")
+    UM -> DB : insert AspNetUsers + AspNetUserRoles
+  end
+  AS -> UM : AddLoginAsync(user, "Google", Subject)
+  UM -> DB : insert AspNetUserLogins
+end
+
+== 5. Final checks ==
+AS -> UM : IsLockedOutAsync(user)
+opt locked out
+  AS --> EP : Fail(LockedOut)
+  EP --> FE : 403 { code: "locked_out" }
+end
+opt email not confirmed yet
+  AS -> UM : EmailConfirmed = true, UpdateAsync
+end
+
+== 6. Create the session (same as /login) ==
+AS -> DB : insert RefreshTokens (hash only)
+AS -> UM : GetRolesAsync(user)
+AS -> AS : JwtTokenGenerator.Create(user, roles)
+AS --> EP : Success(session)
+EP --> FE : 200 { accessToken, accessTokenExpiresAt, user }\nSet-Cookie: refresh token
+FE --> U : logged in
+
+note over AS, DB
+  Identity failures (EnsureSuccess) and unexpected errors
+  throw → GlobalExceptionHandler → 500 with correlationId
+end note
+
+@enduml
